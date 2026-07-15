@@ -40,6 +40,7 @@ import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
+from kiro.config import PROFILE_ARN
 from kiro.tokenizer import count_message_tokens, count_tokens
 
 # Import debug_logger
@@ -97,6 +98,7 @@ async def call_kiro_mcp_api(
             "id": "web_search_tooluse_{22random}_{timestamp}_{8random}",
             "jsonrpc": "2.0",
             "method": "tools/call",
+            "profileArn": "arn:aws:codewhisperer:...:profile/...",
             "params": {
                 "name": "web_search",
                 "arguments": {"query": "..."}
@@ -124,12 +126,23 @@ async def call_kiro_mcp_api(
     random_8 = generate_random_id(8)
     request_id = f"web_search_tooluse_{random_22}_{timestamp}_{random_8}"
     tool_use_id = f"srvtoolu_{uuid.uuid4().hex[:32]}"
+
+    # Kiro's current InvokeMCP API requires profileArn at the top level.
+    # The chat endpoint already sends the same value for all auth types.
+    profile_arn = getattr(auth_manager, "profile_arn", None) or PROFILE_ARN
+    if not profile_arn:
+        logger.error(
+            "MCP API web_search requires profileArn, but no profile ARN is available. "
+            "Load credentials that include profileArn or set PROFILE_ARN."
+        )
+        return None, None
     
     # Build MCP request
     mcp_request = {
         "id": request_id,
         "jsonrpc": "2.0",
         "method": "tools/call",
+        "profileArn": profile_arn,
         "params": {
             "name": "web_search",
             "arguments": {"query": query}
@@ -161,7 +174,13 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                error_body = response.text.strip()
+                if len(error_body) > 1000:
+                    error_body = error_body[:1000] + "..."
+                logger.error(
+                    f"MCP API error: {response.status_code}; "
+                    f"body={error_body or '<empty>'}"
+                )
                 return None, None
             
             mcp_response = response.json()

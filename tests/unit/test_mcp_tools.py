@@ -136,6 +136,15 @@ class TestCallKiroMCPAPI:
         print("Action: Calling call_kiro_mcp_api...")
         with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
+
+        request_payload = mock_post.await_args.kwargs["json"]
+        assert request_payload["jsonrpc"] == "2.0"
+        assert request_payload["method"] == "tools/call"
+        assert request_payload["profileArn"] == mock_auth_manager.profile_arn
+        assert request_payload["params"] == {
+            "name": "web_search",
+            "arguments": {"query": query},
+        }
         
         print(f"Comparing tool_use_id: Got '{tool_use_id}'")
         assert tool_use_id is not None
@@ -178,6 +187,46 @@ class TestCallKiroMCPAPI:
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
         assert tool_use_id is None
         assert results is None
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_uses_config_profile_arn_fallback(self, mock_auth_manager):
+        """PROFILE_ARN is used when loaded credentials do not contain an ARN."""
+        query = "test"
+        configured_profile_arn = (
+            "arn:aws:codewhisperer:us-east-1:123456789:profile/configured"
+        )
+        mock_auth_manager._profile_arn = None
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(
+            return_value={
+                "id": "request-id",
+                "jsonrpc": "2.0",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"results": [], "totalResults": 0, "query": query}
+                            ),
+                        }
+                    ],
+                    "isError": False,
+                },
+            }
+        )
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", configured_profile_arn),
+            patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client),
+        ):
+            _, results = await call_kiro_mcp_api(query, mock_auth_manager)
+
+        assert results is not None
+        assert mock_post.await_args.kwargs["json"]["profileArn"] == configured_profile_arn
     
     @pytest.mark.asyncio
     async def test_mcp_api_http_error(self, mock_auth_manager):
@@ -190,6 +239,7 @@ class TestCallKiroMCPAPI:
         
         mock_response = Mock()
         mock_response.status_code = 500
+        mock_response.text = '{"message":"invalid request"}'
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
@@ -202,6 +252,25 @@ class TestCallKiroMCPAPI:
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
         assert tool_use_id is None
         assert results is None
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_requires_profile_arn(self, mock_auth_manager):
+        """Current Kiro InvokeMCP requests require a top-level profileArn."""
+        mock_auth_manager._profile_arn = None
+        get_access_token = AsyncMock()
+
+        with (
+            patch("kiro.mcp_tools.PROFILE_ARN", ""),
+            patch.object(mock_auth_manager, "get_access_token", get_access_token),
+        ):
+            tool_use_id, results = await call_kiro_mcp_api(
+                "test",
+                mock_auth_manager,
+            )
+
+        assert tool_use_id is None
+        assert results is None
+        get_access_token.assert_not_awaited()
     
     @pytest.mark.asyncio
     async def test_mcp_api_timeout(self, mock_auth_manager):
