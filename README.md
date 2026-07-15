@@ -516,6 +516,7 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/health` | GET | Detailed health check |
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
+| `/v1/responses` | POST | OpenAI Responses API (Codex-compatible) |
 | `/v1/messages` | POST | Anthropic Messages API |
 
 ---
@@ -634,6 +635,53 @@ print(response.content)
 ```
 
 </details>
+
+### OpenAI Responses API and Codex
+
+<details>
+<summary>🔹 Responses cURL Request</summary>
+
+```bash
+curl -N http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful coding agent.",
+    "input": "Inspect this project and summarize its entry points.",
+    "stream": true
+  }'
+```
+
+</details>
+
+Current Codex versions require the Responses wire API. Add a custom provider to
+`~/.codex/config.toml`:
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro_gateway"
+
+[model_providers.kiro_gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+env_key = "KIRO_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+Then export the gateway key before starting Codex:
+
+```bash
+export KIRO_GATEWAY_API_KEY="my-super-secret-password-123"
+codex
+```
+
+Use HTTPS when the gateway is reachable over a network. The adapter is
+stateless: replay previous output Items in the next `input` instead of using
+`previous_response_id`. Function tools, custom tools (including Codex-style raw
+patch tools), and namespace tools are translated to Kiro tool calls. OpenAI-
+hosted tools such as `web_search`, `file_search`, `computer`, and hosted MCP are
+not provided by the Kiro backend and return a clear unsupported-tool error.
 
 ### Anthropic API
 

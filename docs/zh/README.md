@@ -516,6 +516,7 @@ VPN_PROXY_URL=192.168.1.100:8080
 | `/health` | GET | 详细健康检查 |
 | `/v1/models` | GET | 列出可用模型 |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
+| `/v1/responses` | POST | OpenAI Responses API（兼容 Codex） |
 | `/v1/messages` | POST | Anthropic Messages API |
 
 ---
@@ -634,6 +635,51 @@ print(response.content)
 ```
 
 </details>
+
+### OpenAI Responses API 与 Codex
+
+<details>
+<summary>🔹 Responses cURL 请求</summary>
+
+```bash
+curl -N http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "你是一个有帮助的编程代理。",
+    "input": "检查这个项目并概述其入口点。",
+    "stream": true
+  }'
+```
+
+</details>
+
+当前版本的 Codex 要求使用 Responses 协议。在 `~/.codex/config.toml` 中添加自定义提供商：
+
+```toml
+model = "claude-sonnet-4-5"
+model_provider = "kiro_gateway"
+
+[model_providers.kiro_gateway]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+env_key = "KIRO_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+启动 Codex 前导出网关密钥：
+
+```bash
+export KIRO_GATEWAY_API_KEY="my-super-secret-password-123"
+codex
+```
+
+当网关可通过网络访问时，请使用 HTTPS。适配层是无状态的：请在下一次
+`input` 中重放之前的输出 Items，不要使用 `previous_response_id`。function、
+custom（包括 Codex 使用的原始补丁工具）和 namespace 工具会被转换为 Kiro
+工具调用。Kiro 后端不提供 OpenAI 托管的 `web_search`、`file_search`、
+`computer` 和托管 MCP 工具；使用这些工具时会返回明确的“不支持”错误。
 
 ### Anthropic API
 
