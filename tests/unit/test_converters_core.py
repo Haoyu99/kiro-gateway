@@ -3460,6 +3460,24 @@ class TestConvertToolsToKiroFormat:
         print(f"Result: {result}")
         spec = result[0]["toolSpecification"]
         assert spec["description"] == "Tool: focus_chain"
+        assert spec["inputSchema"]["json"] == {"type": "object", "properties": {}}
+
+    @pytest.mark.parametrize("input_schema", [None, {}, {"required": [], "additionalProperties": False}])
+    def test_normalizes_missing_or_sanitized_empty_input_schema(
+        self, input_schema: dict | None
+    ) -> None:
+        """Ensure argument-free tools have a valid object schema.
+
+        Args:
+            input_schema: Missing, empty, or fully stripped tool schema.
+        """
+        tools = [UnifiedTool(name="advisor", description="Advice", input_schema=input_schema)]
+
+        result = convert_tools_to_kiro_format(tools)
+
+        assert result[0]["toolSpecification"]["inputSchema"]["json"] == {
+            "type": "object", "properties": {}
+        }
     
     def test_replaces_none_description_with_placeholder(self):
         """

@@ -616,6 +616,10 @@ def convert_tools_to_kiro_format(tools: Optional[List[UnifiedTool]]) -> List[Dic
     for tool in tools:
         # Sanitize parameters from fields that Kiro API doesn't accept
         sanitized_params = sanitize_json_schema(tool.input_schema)
+        if not sanitized_params:
+            # Kiro requires an object schema even for tools without arguments.
+            sanitized_params = {"type": "object", "properties": {}}
+            logger.debug(f"Tool '{tool.name}' has no input schema; using an empty object schema")
         
         # Kiro API requires non-empty description
         description = tool.description
