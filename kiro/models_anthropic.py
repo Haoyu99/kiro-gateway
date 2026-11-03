@@ -178,16 +178,26 @@ ContentBlock = Union[
 # ==================================================================================================
 
 
+# Roles accepted inside the messages array.
+# 'system' / 'developer' are not part of the Anthropic spec, but some clients send
+# them there; they are normalized to 'user' before reaching Kiro.
+AnthropicMessageRole = Literal["user", "assistant", "system", "developer"]
+
+
 class AnthropicMessage(BaseModel):
     """
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role. Anthropic natively only sends 'user'/'assistant'
+            (system prompt goes in the top-level `system` field), but some
+            clients place 'system'/'developer' messages inside the array.
+            Those are accepted and normalized to 'user' downstream by
+            normalize_message_roles(); any other value is rejected (422).
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: AnthropicMessageRole
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}

@@ -377,6 +377,29 @@ class TestMessagesValidation:
         # Should pass validation (not 422)
         assert response.status_code != 422
 
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_accepts_system_and_developer_roles_in_messages(self, test_client, valid_proxy_api_key, role):
+        """
+        What it does: Verifies system/developer messages inside the array pass validation.
+        Purpose: Some clients send them there; they are normalized to 'user' downstream.
+        """
+        print(f"Action: POST /v1/messages with role='{role}' in messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": role, "content": "Be brief."},
+                    {"role": "user", "content": "Hello"}
+                ]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code != 422
+
 
 # =============================================================================
 # Tests for /v1/messages system prompt

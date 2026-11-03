@@ -2013,3 +2013,39 @@ class TestAnthropicToKiroNativeReasoning:
             self._request(output_config={"effort": "max"}), "conv", "arn", model_cache=cache
         )
         assert "additionalModelRequestFields" not in payload
+
+
+class TestAnthropicToKiroNonStandardRoles:
+    """Tests for system/developer messages inside the Anthropic messages array."""
+
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_non_standard_role_is_sent_as_user(self, role):
+        """
+        What it does: A system/developer message in the array reaches Kiro as a user turn.
+        Purpose: Kiro history only supports user/assistant; content must not be dropped.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role=role, content="Always answer in French."),
+                AnthropicMessage(role="assistant", content="D'accord."),
+                AnthropicMessage(role="user", content="Hello"),
+            ],
+        )
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            payload = anthropic_to_kiro(request, "conv", "arn")
+        history = payload["conversationState"]["history"]
+
+        # Kiro history only has user/assistant entries
+        assert all(set(entry) <= {"userInputMessage", "assistantResponseMessage"} for entry in history)
+
+        # The system/developer text is preserved and sent as a user turn
+        user_turns = [e["userInputMessage"]["content"] for e in history if "userInputMessage" in e]
+        assert any(c.endswith("Always answer in French.") for c in user_turns)
+
+        # Roles strictly alternate (Kiro API requirement)
+        kinds = [next(iter(entry)) for entry in history]
+        assert all(a != b for a, b in zip(kinds, kinds[1:]))
+
+        assert payload["conversationState"]["currentMessage"]["userInputMessage"]["content"] == "Hello"

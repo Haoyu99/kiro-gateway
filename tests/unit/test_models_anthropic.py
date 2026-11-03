@@ -1757,3 +1757,33 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+class TestAnthropicMessageRoleValidation:
+    """Tests for AnthropicMessage.role validation."""
+
+    @pytest.mark.parametrize("role", ["user", "assistant", "system", "developer"])
+    def test_accepts_known_roles(self, role):
+        """
+        What it does: Accepts spec roles plus system/developer.
+        Purpose: Some clients put system/developer messages in the array (previously 422).
+        """
+        assert AnthropicMessage(role=role, content="Hello").role == role
+
+    @pytest.mark.parametrize("role", ["invalid_role", "", "User", "tool", "function", "SYSTEM"])
+    def test_rejects_unknown_roles(self, role):
+        """
+        What it does: Rejects typos and roles outside the allowed set.
+        Purpose: Malformed requests still fail fast at the validation boundary.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role=role, content="Hello")
+
+    @pytest.mark.parametrize("role", [None, 1, ["user"]])
+    def test_rejects_non_string_roles(self, role):
+        """
+        What it does: Rejects non-string role values.
+        Purpose: Guard against malformed JSON from clients.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role=role, content="Hello")
