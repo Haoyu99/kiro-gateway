@@ -275,6 +275,13 @@ async def _process_chunk(
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
         
+        elif event["type"] == "reasoning":
+            # Native reasoning from the model (reasoningContentEvent).
+            # Honors FAKE_REASONING_HANDLING="remove" so users who hide
+            # reasoning keep hiding it; otherwise exposed like fake reasoning.
+            if FAKE_REASONING_HANDLING != "remove":
+                yield KiroEvent(type="thinking", thinking_content=event["data"])
+        
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
         

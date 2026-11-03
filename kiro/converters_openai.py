@@ -29,13 +29,21 @@ Contains functions for:
 - Building Kiro payload from OpenAI requests
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
 from kiro.config import HIDDEN_MODELS
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
+from kiro.native_reasoning import (
+    ReasoningRequest,
+    build_additional_model_request_fields,
+    supports_native_reasoning,
+)
+
+if TYPE_CHECKING:
+    from kiro.cache import ModelInfoCache
 
 # Import from core - reuse shared logic
 from kiro.converters_core import (
@@ -306,7 +314,7 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
     
     Args:
         max_tokens: Maximum output tokens for the request
-        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh")
+        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh", "max")
     
     Returns:
         Thinking budget in tokens
@@ -324,6 +332,7 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
         "medium": 0.50,   # 50% - balanced reasoning
         "high": 0.80,     # 80% - deep reasoning
         "xhigh": 0.95,    # 95% - maximum reasoning depth
+        "max": 0.95,      # 95% - same cap as xhigh for fake reasoning
     }
     return int(max_tokens * percent[effort])
 
@@ -386,6 +395,32 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     return ThinkingConfig(enabled=True, budget_tokens=budget)
 
 
+def extract_reasoning_request_from_openai(request: ChatCompletionRequest) -> ReasoningRequest:
+    """
+    Extract native reasoning intent from an OpenAI request.
+
+    Args:
+        request: OpenAI ChatCompletionRequest
+
+    Returns:
+        ReasoningRequest (empty when reasoning_effort is not set)
+
+    Examples:
+        >>> request.reasoning_effort = "high"
+        >>> extract_reasoning_request_from_openai(request)
+        ReasoningRequest(effort='high', disabled=False, enabled=False, display=None)
+        >>> request.reasoning_effort = "none"
+        >>> extract_reasoning_request_from_openai(request)
+        ReasoningRequest(effort=None, disabled=True, enabled=False, display=None)
+    """
+    effort = request.reasoning_effort
+    if not effort:
+        return ReasoningRequest()
+    if effort == "none":
+        return ReasoningRequest(disabled=True)
+    return ReasoningRequest(effort=effort)
+
+
 # ==================================================================================================
 # Main Entry Point
 # ==================================================================================================
@@ -393,7 +428,8 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
-    profile_arn: str
+    profile_arn: str,
+    model_cache: Optional["ModelInfoCache"] = None,
 ) -> dict:
     """
     Builds complete payload for Kiro API from OpenAI request.
@@ -405,6 +441,8 @@ def build_kiro_payload(
         request_data: Request in OpenAI format
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_cache: Account model cache. Used to read the model's native
+            reasoning schema; without it native reasoning fields are not sent
     
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -424,12 +462,20 @@ def build_kiro_payload(
     
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)
+
+    # Native reasoning (models that advertise additionalModelRequestFieldsSchema)
+    model_info = model_cache.get(model_id) if model_cache else None
+    use_native_reasoning = supports_native_reasoning(model_info)
+    additional_fields = build_additional_model_request_fields(
+        model_info, extract_reasoning_request_from_openai(request_data), model_id
+    )
     
     logger.debug(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_reasoning={use_native_reasoning}, additional_fields={additional_fields}"
     )
     
     # Use core function to build payload
@@ -440,7 +486,9 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        additional_model_request_fields=additional_fields,
+        use_native_reasoning=use_native_reasoning,
     )
     
     return result.payload

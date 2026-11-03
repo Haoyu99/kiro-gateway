@@ -1832,3 +1832,71 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+class TestParseKiroStreamNativeReasoning:
+    """Tests for native reasoning events in parse_kiro_stream()."""
+
+    async def _collect(self, mock_response, mock_parser, handling):
+        async def mock_aiter_bytes():
+            yield b"chunk1"
+        mock_response.aiter_bytes = mock_aiter_bytes
+        events = []
+        with patch("kiro.streaming_core.AwsEventStreamParser", return_value=mock_parser):
+            with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+                with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", handling):
+                    async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                        events.append(event)
+        return events
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handling", ["as_reasoning_content", "pass", "strip_tags"])
+    async def test_reasoning_events_become_thinking_events(self, mock_response, mock_parser, handling):
+        """
+        What it does: Parser reasoning events are yielded as thinking KiroEvents.
+        Purpose: OpenAI/Anthropic layers already render thinking events for both modes.
+        """
+        mock_parser.feed.return_value = [
+            {"type": "reasoning", "data": "step 1"},
+            {"type": "reasoning", "data": " step 2"},
+            {"type": "content", "data": "answer"},
+        ]
+        events = await self._collect(mock_response, mock_parser, handling)
+        thinking = [e.thinking_content for e in events if e.type == "thinking"]
+        content = [e.content for e in events if e.type == "content"]
+        assert thinking == ["step 1", " step 2"]
+        assert content == ["answer"]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_dropped_in_remove_mode(self, mock_response, mock_parser):
+        """
+        What it does: FAKE_REASONING_HANDLING=remove hides native reasoning too.
+        Purpose: Users who hide reasoning keep hiding it.
+        """
+        mock_parser.feed.return_value = [
+            {"type": "reasoning", "data": "hidden"},
+            {"type": "content", "data": "answer"},
+        ]
+        events = await self._collect(mock_response, mock_parser, "remove")
+        assert [e.type for e in events] == ["content"]
+
+    @pytest.mark.asyncio
+    async def test_collect_stream_accumulates_native_reasoning(self, mock_response, mock_parser):
+        """
+        What it does: collect_stream_to_result() fills thinking_content from native reasoning.
+        Purpose: Non-streaming responses expose reasoning as well.
+        """
+        mock_parser.feed.return_value = [
+            {"type": "reasoning", "data": "a"},
+            {"type": "reasoning", "data": "b"},
+            {"type": "content", "data": "391"},
+        ]
+        async def mock_aiter_bytes():
+            yield b"chunk1"
+        mock_response.aiter_bytes = mock_aiter_bytes
+        with patch("kiro.streaming_core.AwsEventStreamParser", return_value=mock_parser):
+            with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False):
+                with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+                    result = await collect_stream_to_result(mock_response)
+        assert result.thinking_content == "ab"
+        assert result.content == "391"

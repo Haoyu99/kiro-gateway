@@ -1357,3 +1357,81 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+class TestAwsEventStreamParserReasoningEvents:
+    """Tests for native reasoning (reasoningContentEvent) parsing."""
+
+    def _frame(self, payload: str) -> bytes:
+        """Wrap a JSON payload like an AWS event stream frame."""
+        return (
+            b"\x00\x00\x00\x7f\x00\x00\x00[:event-type\x07\x00\x15reasoningContentEvent"
+            b"\r:content-type\x07\x00\x10application/json\r:message-type\x07\x00\x05event"
+            + payload.encode("utf-8") + b"\x9b+\x9c\xe9"
+        )
+
+    def test_reasoning_text_becomes_reasoning_event(self):
+        """
+        What it does: Parses {"text": ...} from reasoningContentEvent.
+        Purpose: Native reasoning text must reach clients (previously dropped).
+        """
+        parser = AwsEventStreamParser()
+        events = parser.feed(self._frame('{"text":"Checking 9991"}'))
+        assert events == [{"type": "reasoning", "data": "Checking 9991"}]
+
+    def test_repeated_reasoning_fragments_are_not_deduplicated(self):
+        """
+        What it does: Two identical fragments yield two events.
+        Purpose: Token-sized fragments repeat legitimately (e.g. "9" then "9").
+        """
+        parser = AwsEventStreamParser()
+        events = parser.feed(self._frame('{"text":"9"}') + self._frame('{"text":"9"}'))
+        assert [e["data"] for e in events] == ["9", "9"]
+
+    def test_signature_only_payload_is_skipped(self):
+        """
+        What it does: {"signature": ...} without text yields nothing.
+        Purpose: Signatures are opaque and must not leak into output.
+        """
+        parser = AwsEventStreamParser()
+        assert parser.feed(self._frame('{"signature":".KTR~~eyJlbmNy"}')) == []
+
+    @pytest.mark.parametrize("payload", ['{"text":""}', '{"text":null}', '{"text":123}'])
+    def test_empty_or_non_string_text_is_skipped(self, payload):
+        """
+        What it does: Empty, null and non-string text are ignored.
+        Purpose: Malformed upstream data must not crash or emit junk.
+        """
+        parser = AwsEventStreamParser()
+        assert parser.feed(self._frame(payload)) == []
+
+    def test_reasoning_split_across_chunks(self):
+        """
+        What it does: A reasoning JSON split over two chunks is parsed once complete.
+        Purpose: Network chunk boundaries are arbitrary.
+        """
+        parser = AwsEventStreamParser()
+        frame = self._frame('{"text":"split here"}')
+        cut = frame.index(b"split") + 3
+        assert parser.feed(frame[:cut]) == []
+        assert parser.feed(frame[cut:]) == [{"type": "reasoning", "data": "split here"}]
+
+    def test_reasoning_then_content_keeps_order(self):
+        """
+        What it does: Reasoning followed by content yields both, in order.
+        Purpose: Reasoning blocks must precede the answer.
+        """
+        parser = AwsEventStreamParser()
+        events = parser.feed(self._frame('{"text":"think"}') + b'{"content":"391"}')
+        assert [e["type"] for e in events] == ["reasoning", "content"]
+        assert events[1]["data"] == "391"
+
+    def test_text_key_inside_content_string_is_not_reasoning(self):
+        """
+        What it does: A content string that mentions {"text": ...} stays content.
+        Purpose: Escaped JSON inside strings must not be mistaken for an event.
+        """
+        parser = AwsEventStreamParser()
+        events = parser.feed(b'{"content":"use {\\"text\\": 1} here"}')
+        assert len(events) == 1
+        assert events[0]["type"] == "content"

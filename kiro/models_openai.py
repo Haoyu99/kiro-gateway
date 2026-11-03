@@ -166,7 +166,8 @@ class ChatCompletionRequest(BaseModel):
     
     # Reasoning (OpenAI reasoning models)
     # Supports all official reasoning_effort levels from OpenAI API
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
+    # "max" is accepted for Kiro models with native reasoning (mapped per model schema)
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
     
     # Tools (function calling)
     tools: Optional[List[Tool]] = None

@@ -222,6 +222,8 @@ class AwsEventStreamParser:
     - tool_stop: End of tool call
     - usage: Credit consumption information
     - context_usage: Context usage percentage
+    - reasoning: Native reasoning text (reasoningContentEvent, models with
+      native reasoning effort support). Signature-only payloads are skipped.
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -246,6 +248,9 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        # reasoningContentEvent: {"text": "..."} and/or {"signature": "..."}
+        ('{"text":', 'reasoning'),
+        ('{"signature":', 'reasoning'),
     ]
     
     def __init__(self):
@@ -328,8 +333,29 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'reasoning':
+            return self._process_reasoning_event(data)
         
         return None
+    
+    def _process_reasoning_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes native reasoning event (reasoningContentEvent).
+        
+        Reasoning text arrives as token-sized fragments, so repeated fragments
+        are legitimate and are NOT deduplicated (unlike content events).
+        Signature-only payloads carry no readable text and are skipped.
+        
+        Args:
+            data: Parsed JSON, e.g. {"text": "Checking"} or {"signature": "..."}
+        
+        Returns:
+            {"type": "reasoning", "data": str} or None if there is no text
+        """
+        text = data.get('text')
+        if not isinstance(text, str) or not text:
+            return None
+        return {"type": "reasoning", "data": text}
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""

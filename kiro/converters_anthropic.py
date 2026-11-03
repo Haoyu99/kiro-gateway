@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -43,6 +43,14 @@ from kiro.converters_core import (
     extract_text_content,
     extract_images_from_content,
 )
+from kiro.native_reasoning import (
+    ReasoningRequest,
+    build_additional_model_request_fields,
+    supports_native_reasoning,
+)
+
+if TYPE_CHECKING:
+    from kiro.cache import ModelInfoCache
 
 
 def convert_anthropic_content_to_text(content: Any) -> str:
@@ -426,8 +434,50 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
+# Anthropic thinking.type values that turn reasoning on
+ANTHROPIC_THINKING_ON_TYPES = ("enabled", "adaptive")
+
+
+def extract_reasoning_request_from_anthropic(request: AnthropicMessagesRequest) -> ReasoningRequest:
+    """
+    Extract native reasoning intent from an Anthropic request.
+
+    Reads `thinking` ({"type": "enabled" | "adaptive" | "disabled", "display": ...})
+    and `output_config.effort`. `thinking.budget_tokens` has no native equivalent
+    and only affects fake reasoning.
+
+    Args:
+        request: Anthropic MessagesRequest
+
+    Returns:
+        ReasoningRequest (empty when neither field is set)
+
+    Examples:
+        >>> request.thinking = {"type": "adaptive"}
+        >>> request.output_config = {"effort": "max"}
+        >>> extract_reasoning_request_from_anthropic(request)
+        ReasoningRequest(effort='max', disabled=False, enabled=True, display=None)
+    """
+    thinking = request.thinking if isinstance(request.thinking, dict) else {}
+    output_config = request.output_config if isinstance(request.output_config, dict) else {}
+
+    thinking_type = thinking.get("type")
+    display = thinking.get("display")
+    effort = output_config.get("effort")
+
+    return ReasoningRequest(
+        effort=effort if isinstance(effort, str) and effort else None,
+        disabled=thinking_type == "disabled",
+        enabled=thinking_type in ANTHROPIC_THINKING_ON_TYPES,
+        display=display if isinstance(display, str) and display else None,
+    )
+
+
 def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+    request: AnthropicMessagesRequest,
+    conversation_id: str,
+    profile_arn: str,
+    model_cache: Optional["ModelInfoCache"] = None,
 ) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
@@ -443,6 +493,8 @@ def anthropic_to_kiro(
         request: Anthropic MessagesRequest
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_cache: Account model cache. Used to read the model's native
+            reasoning schema; without it native reasoning fields are not sent
 
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -467,11 +519,19 @@ def anthropic_to_kiro(
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
 
+    # Native reasoning (models that advertise additionalModelRequestFieldsSchema)
+    model_info = model_cache.get(model_id) if model_cache else None
+    use_native_reasoning = supports_native_reasoning(model_info)
+    additional_fields = build_additional_model_request_fields(
+        model_info, extract_reasoning_request_from_anthropic(request), model_id
+    )
+
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"native_reasoning={use_native_reasoning}, additional_fields={additional_fields}"
     )
 
     # Use core function to build payload
@@ -483,6 +543,8 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        additional_model_request_fields=additional_fields,
+        use_native_reasoning=use_native_reasoning,
     )
 
     return result.payload

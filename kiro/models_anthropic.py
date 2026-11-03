@@ -311,6 +311,8 @@ class AnthropicMessagesRequest(BaseModel):
         top_k: Top-k sampling
         stop_sequences: Custom stop sequences
         metadata: Request metadata
+        thinking: Extended thinking config ({"type": "enabled" | "adaptive" | "disabled", ...})
+        output_config: Output config, e.g. {"effort": "low" | "medium" | "high" | "xhigh" | "max"}
     """
 
     model: str
@@ -323,6 +325,9 @@ class AnthropicMessagesRequest(BaseModel):
 
     # Extended thinking (official Anthropic parameter)
     thinking: Optional[Dict[str, Any]] = None
+
+    # Output configuration (official Anthropic parameter), e.g. {"effort": "high"}
+    output_config: Optional[Dict[str, Any]] = None
 
     # Tools
     tools: Optional[List[AnthropicTool]] = None

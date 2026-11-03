@@ -14,11 +14,15 @@ Tests the AccountManager class that manages multiple Kiro accounts with:
 import asyncio
 import json
 import pytest
+from fastapi import HTTPException
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from kiro.account_manager import (
+    _get_list_models_url,
+    _fetch_models_list,
+
     Account,
     AccountStats,
     ModelAccountList,
@@ -806,10 +810,12 @@ class TestAccountManagerInitializeAccount:
         await manager.load_credentials()
         account_id = str(test_json.resolve())
         
-        # Mock HTTP client to fail
+        # Mock HTTP client to fail the way KiroHttpClient does after exhausting retries
         with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
             mock_client = AsyncMock()
-            mock_client.request_with_retry = AsyncMock(side_effect=Exception("Network error"))
+            mock_client.request_with_retry = AsyncMock(
+                side_effect=HTTPException(status_code=502, detail="Network error")
+            )
             mock_client.close = AsyncMock()
             mock_http_class.return_value = mock_client
             
@@ -1300,3 +1306,121 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestModelListFetching:
+    """Tests for _get_list_models_url() and _fetch_models_list()."""
+
+    def _auth(self, api_host, api_region="us-east-1", profile_arn="arn:aws:codewhisperer:us-east-1:1:profile/x"):
+        auth = Mock()
+        auth.api_host = api_host
+        auth.api_region = api_region
+        auth.q_host = api_host
+        auth.profile_arn = profile_arn
+        return auth
+
+    def test_runtime_endpoint_uses_q_host_of_api_region(self):
+        """
+        What it does: runtime.kiro.dev accounts list models from q.{region}.amazonaws.com.
+        Purpose: runtime.kiro.dev returns UnknownOperationException for this call (verified live).
+        """
+        auth = self._auth("https://runtime.eu-central-1.kiro.dev", api_region="eu-central-1")
+        assert _get_list_models_url(auth) == "https://q.eu-central-1.amazonaws.com/ListAvailableModels"
+
+    def test_legacy_endpoint_keeps_q_host(self):
+        """
+        What it does: Non-runtime endpoints keep using their own Q host.
+        Purpose: No behavior change for legacy configurations.
+        """
+        auth = self._auth("https://q.us-east-1.amazonaws.com")
+        assert _get_list_models_url(auth) == "https://q.us-east-1.amazonaws.com/ListAvailableModels"
+
+    async def _fetch(self, auth, status=200, body=None):
+        with patch("kiro.account_manager.KiroHttpClient") as mock_http_class:
+            client = AsyncMock()
+            response = Mock()
+            response.status_code = status
+            response.json.return_value = body
+            client.request_with_retry = AsyncMock(return_value=response)
+            client.close = AsyncMock()
+            mock_http_class.return_value = client
+            try:
+                return await _fetch_models_list(auth), client
+            finally:
+                client.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_models_with_schema_and_sends_profile_arn(self):
+        """
+        What it does: Returns model dicts (schema preserved) and sends profileArn.
+        Purpose: Schemas drive native reasoning; profileArn scopes enterprise lists.
+        """
+        auth = self._auth("https://runtime.us-east-1.kiro.dev")
+        models = [{"modelId": "claude-haiku-5.5", "additionalModelRequestFieldsSchema": {"properties": {}}}]
+        result, client = await self._fetch(auth, body={"models": models})
+        assert result == models
+        params = client.request_with_retry.call_args.kwargs["params"]
+        assert params == {"origin": "AI_EDITOR", "profileArn": auth.profile_arn}
+
+    @pytest.mark.asyncio
+    async def test_omits_profile_arn_when_unknown(self):
+        """
+        What it does: No profileArn param when the account has none.
+        Purpose: Avoid sending an empty profileArn.
+        """
+        auth = self._auth("https://runtime.us-east-1.kiro.dev", profile_arn=None)
+        _, client = await self._fetch(auth, body={"models": [{"modelId": "auto"}]})
+        assert "profileArn" not in client.request_with_retry.call_args.kwargs["params"]
+
+    @pytest.mark.asyncio
+    async def test_skips_entries_without_model_id(self):
+        """
+        What it does: Drops malformed entries but keeps valid ones.
+        Purpose: ModelInfoCache.update() requires modelId on every entry.
+        """
+        auth = self._auth("https://runtime.us-east-1.kiro.dev")
+        result, _ = await self._fetch(auth, body={"models": [{"modelId": "auto"}, {"name": "x"}, "junk"]})
+        assert result == [{"modelId": "auto"}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status,body",
+        [
+            (404, {"models": [{"modelId": "auto"}]}),
+            (200, {"models": []}),
+            (200, {"models": None}),
+            (200, {}),
+            (200, ["not", "an", "object"]),
+            (200, {"models": [{"name": "no-id"}]}),
+        ],
+    )
+    async def test_invalid_responses_raise_value_error(self, status, body):
+        """
+        What it does: Non-200 and malformed bodies raise ValueError.
+        Purpose: Callers fall back to FALLBACK_MODELS instead of caching junk.
+        """
+        auth = self._auth("https://runtime.us-east-1.kiro.dev")
+        with pytest.raises(ValueError):
+            await self._fetch(auth, status=status, body=body)
+
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_stale_cache_on_failure(self, tmp_path):
+        """
+        What it does: TTL refresh failure leaves the existing cache untouched.
+        Purpose: A transient outage must not wipe model schemas.
+        """
+        manager = AccountManager(credentials_file=str(tmp_path / "c.json"), state_file=str(tmp_path / "s.json"))
+        account = Mock()
+        account.auth_manager = self._auth("https://runtime.us-east-1.kiro.dev")
+        account.model_cache = ModelInfoCache()
+        await account.model_cache.update([{"modelId": "claude-haiku-5.5"}])
+        account.models_cached_at = 123.0
+        manager._accounts = {"acc": account}
+        with patch("kiro.account_manager.KiroHttpClient") as mock_http_class:
+            client = AsyncMock()
+            client.request_with_retry = AsyncMock(side_effect=HTTPException(status_code=502, detail="down"))
+            client.close = AsyncMock()
+            mock_http_class.return_value = client
+            await manager._refresh_account_models("acc")
+        assert account.model_cache.is_valid_model("claude-haiku-5.5")
+        assert account.models_cached_at == 123.0

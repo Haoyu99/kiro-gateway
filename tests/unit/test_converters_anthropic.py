@@ -1884,3 +1884,132 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+def _native_cache(schema_properties):
+    """Model cache mock returning one model with the given schema properties."""
+    cache = MagicMock()
+    cache.get.return_value = {
+        "modelId": "claude-haiku-5.5",
+        "additionalModelRequestFieldsSchema": {"type": "object", "properties": schema_properties},
+    }
+    return cache
+
+
+CLAUDE_PROPS = {
+    "thinking": {"type": "object", "properties": {
+        "type": {"type": "string", "enum": ["adaptive", "disabled"]},
+        "display": {"type": "string", "enum": ["summarized", "omitted"]}}},
+    "output_config": {"type": "object", "properties": {
+        "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}}},
+}
+GPT_PROPS = {
+    "reasoning": {"type": "object", "properties": {
+        "effort": {"type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max"]}}},
+}
+
+
+class TestAnthropicToKiroNativeReasoning:
+    """Tests for native reasoning in anthropic_to_kiro()."""
+
+    def _request(self, **kwargs):
+        return AnthropicMessagesRequest(
+            model="claude-haiku-5-5",
+            messages=[AnthropicMessage(role="user", content="Is 9991 prime?")],
+            max_tokens=4096,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_output_config_effort_is_forwarded(self, effort):
+        """
+        What it does: Anthropic output_config.effort reaches Kiro unchanged.
+        Purpose: The five Kiro levels map 1:1 for Claude clients.
+        """
+        payload = anthropic_to_kiro(
+            self._request(thinking={"type": "adaptive"}, output_config={"effort": effort}),
+            "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS),
+        )
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": effort},
+        }
+
+    def test_thinking_enabled_with_budget_turns_on_adaptive_thinking(self):
+        """
+        What it does: Legacy thinking.type=enabled maps to adaptive thinking.
+        Purpose: Clients using budget_tokens still get native reasoning.
+        """
+        payload = anthropic_to_kiro(
+            self._request(thinking={"type": "enabled", "budget_tokens": 8000}),
+            "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS),
+        )
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive", "display": "summarized"}
+        }
+
+    def test_thinking_disabled_is_forwarded(self):
+        """
+        What it does: thinking.type=disabled maps to Kiro thinking disabled.
+        Purpose: Claude clients can switch reasoning off.
+        """
+        payload = anthropic_to_kiro(
+            self._request(thinking={"type": "disabled"}), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS)
+        )
+        assert payload["additionalModelRequestFields"] == {"thinking": {"type": "disabled"}}
+
+    def test_display_omitted_is_respected(self):
+        """
+        What it does: thinking.display=omitted is passed through.
+        Purpose: Clients can request no reasoning text.
+        """
+        payload = anthropic_to_kiro(
+            self._request(thinking={"type": "adaptive", "display": "omitted"}, output_config={"effort": "low"}),
+            "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS),
+        )
+        assert payload["additionalModelRequestFields"]["thinking"]["display"] == "omitted"
+
+    def test_no_thinking_and_no_output_config_sends_nothing(self):
+        """
+        What it does: Plain request sends no native fields.
+        Purpose: Model defaults apply.
+        """
+        payload = anthropic_to_kiro(self._request(), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS))
+        assert "additionalModelRequestFields" not in payload
+
+    @pytest.mark.parametrize("bad", ["not-a-dict", ["list"], {"effort": 5}, {"effort": ""}])
+    def test_malformed_output_config_is_ignored(self, bad):
+        """
+        What it does: Malformed output_config values do not crash or leak.
+        Purpose: Validate input at the trust boundary.
+        """
+        try:
+            request = self._request(output_config=bad)
+        except Exception:
+            return  # Rejected by the request model, which is also acceptable
+        payload = anthropic_to_kiro(request, "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS))
+        assert "output_config" not in payload.get("additionalModelRequestFields", {})
+
+    def test_native_model_skips_fake_thinking_tags(self):
+        """
+        What it does: No fake thinking tags for native-reasoning models.
+        Purpose: The model must not reason twice.
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = anthropic_to_kiro(
+                self._request(output_config={"effort": "max"}), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS)
+            )
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "<thinking_mode>" not in content
+
+    def test_model_without_schema_sends_no_fields(self):
+        """
+        What it does: Unsupported model never receives additionalModelRequestFields.
+        Purpose: Kiro rejects the field for those models (verified live).
+        """
+        cache = MagicMock()
+        cache.get.return_value = None
+        payload = anthropic_to_kiro(
+            self._request(output_config={"effort": "max"}), "conv", "arn", model_cache=cache
+        )
+        assert "additionalModelRequestFields" not in payload

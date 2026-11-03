@@ -383,7 +383,8 @@ async def messages(
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_cache=model_cache,
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -691,7 +692,8 @@ async def messages(
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_cache=model_cache,
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")

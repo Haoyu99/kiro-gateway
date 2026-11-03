@@ -1413,7 +1413,9 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    additional_model_request_fields: Optional[Dict[str, Any]] = None,
+    use_native_reasoning: bool = False,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1429,6 +1431,12 @@ def build_kiro_payload(
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
         thinking_config: Thinking configuration from API adapter
+        additional_model_request_fields: Native model fields (e.g. reasoning effort)
+            already validated against the model schema; sent as top-level
+            additionalModelRequestFields when not empty
+        use_native_reasoning: True if the model reasons natively. Fake reasoning
+            (thinking tag injection and its system prompt addition) is skipped
+            so the model does not reason twice
     
     Returns:
         KiroPayloadResult with payload and tool documentation
@@ -1448,7 +1456,7 @@ def build_kiro_payload(
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
     # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
+    thinking_system_addition = "" if use_native_reasoning else get_thinking_system_prompt_addition()
     if thinking_system_addition:
         full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
@@ -1551,7 +1559,8 @@ def build_kiro_payload(
             user_input_context["toolResults"] = tool_results
     
     # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    # Skipped for models with native reasoning (they reason on their own)
+    if current_message.role == "user" and not use_native_reasoning:
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
@@ -1587,6 +1596,11 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Native model fields (reasoning effort etc.) go at the top level of the payload.
+    # Kiro ignores them anywhere else and rejects them for models without a schema.
+    if additional_model_request_fields:
+        payload["additionalModelRequestFields"] = additional_model_request_fields
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

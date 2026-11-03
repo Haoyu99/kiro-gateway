@@ -10,7 +10,7 @@ Tests for OpenAI-specific conversion logic:
 """
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from kiro.converters_openai import (
     build_kiro_payload,
@@ -1872,3 +1872,131 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+def _native_cache(schema_properties):
+    """Model cache mock returning one model with the given schema properties."""
+    cache = MagicMock()
+    cache.get.return_value = {
+        "modelId": "claude-haiku-5.5",
+        "additionalModelRequestFieldsSchema": {"type": "object", "properties": schema_properties},
+    }
+    return cache
+
+
+CLAUDE_PROPS = {
+    "thinking": {"type": "object", "properties": {
+        "type": {"type": "string", "enum": ["adaptive", "disabled"]},
+        "display": {"type": "string", "enum": ["summarized", "omitted"]}}},
+    "output_config": {"type": "object", "properties": {
+        "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]}}},
+}
+GPT_PROPS = {
+    "reasoning": {"type": "object", "properties": {
+        "effort": {"type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max"]}}},
+}
+
+
+class TestBuildKiroPayloadNativeReasoning:
+    """Tests for native reasoning in OpenAI build_kiro_payload()."""
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(
+            model="claude-haiku-5.5",
+            messages=[ChatMessage(role="user", content="Is 9991 prime?")],
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+    def test_effort_sent_as_top_level_additional_fields(self, effort):
+        """
+        What it does: reasoning_effort becomes top-level additionalModelRequestFields.
+        Purpose: Kiro only honors the field at the payload top level (verified live).
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = build_kiro_payload(
+                self._request(reasoning_effort=effort), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS)
+            )
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": effort},
+        }
+        assert "additionalModelRequestFields" not in payload["conversationState"]
+
+    def test_native_model_skips_fake_thinking_tags(self):
+        """
+        What it does: No <thinking_mode> tags for native-reasoning models.
+        Purpose: The model must not reason twice.
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = build_kiro_payload(
+                self._request(reasoning_effort="high"), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS)
+            )
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "<thinking_mode>" not in content
+        assert "Extended Thinking Mode" not in content
+
+    def test_native_model_without_effort_sends_no_fields(self):
+        """
+        What it does: No reasoning_effort means no additionalModelRequestFields.
+        Purpose: Model defaults apply (transparent pass-through).
+        """
+        payload = build_kiro_payload(self._request(), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS))
+        assert "additionalModelRequestFields" not in payload
+
+    def test_none_effort_disables_thinking(self):
+        """
+        What it does: reasoning_effort="none" maps to thinking.type=disabled.
+        Purpose: OpenAI clients can switch reasoning off.
+        """
+        payload = build_kiro_payload(
+            self._request(reasoning_effort="none"), "conv", "arn", model_cache=_native_cache(CLAUDE_PROPS)
+        )
+        assert payload["additionalModelRequestFields"] == {"thinking": {"type": "disabled"}}
+
+    def test_gpt_model_gets_reasoning_effort(self):
+        """
+        What it does: GPT schema yields reasoning.effort.
+        Purpose: Both schema families work through the OpenAI API.
+        """
+        payload = build_kiro_payload(
+            self._request(reasoning_effort="max"), "conv", "arn", model_cache=_native_cache(GPT_PROPS)
+        )
+        assert payload["additionalModelRequestFields"] == {"reasoning": {"effort": "max"}}
+
+    def test_model_without_schema_keeps_fake_reasoning(self):
+        """
+        What it does: Unsupported model: no native fields, fake tags still injected.
+        Purpose: Older models keep working exactly as before.
+        """
+        cache = MagicMock()
+        cache.get.return_value = {"modelId": "claude-sonnet-4.5", "additionalModelRequestFieldsSchema": None}
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = build_kiro_payload(self._request(reasoning_effort="high"), "conv", "arn", model_cache=cache)
+        assert "additionalModelRequestFields" not in payload
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "<thinking_mode>enabled</thinking_mode>" in content
+
+    def test_without_model_cache_behaves_as_before(self):
+        """
+        What it does: Omitting model_cache sends no native fields.
+        Purpose: Backward compatible signature for existing callers.
+        """
+        payload = build_kiro_payload(self._request(reasoning_effort="high"), "conv", "arn")
+        assert "additionalModelRequestFields" not in payload
+
+    def test_max_effort_is_accepted_by_request_model(self):
+        """
+        What it does: reasoning_effort="max" passes validation.
+        Purpose: Kiro exposes a fifth level beyond OpenAI's xhigh.
+        """
+        assert self._request(reasoning_effort="max").reasoning_effort == "max"
+
+    def test_max_effort_budget_for_fake_reasoning(self):
+        """
+        What it does: "max" maps to a fake reasoning budget (no KeyError).
+        Purpose: Models without native reasoning still accept max.
+        """
+        config = extract_thinking_config_from_openai(self._request(reasoning_effort="max", max_tokens=1000))
+        assert config.enabled is True
+        assert config.budget_tokens == 950
