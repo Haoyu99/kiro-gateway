@@ -1345,10 +1345,6 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         if msg.role == "user":
             content = extract_text_content(msg.content)
             
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
-            
             user_input = {
                 "content": content,
                 "modelId": model_id,
@@ -1377,6 +1373,12 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
                 tool_results = extract_tool_results_from_content(msg.content)
                 if tool_results:
                     user_input_context["toolResults"] = tool_results
+            
+            # Fallback for empty content. Turns that carry toolResults are sent with
+            # empty content (accepted by Kiro); only turns with neither text nor
+            # tool results get the placeholder.
+            if not content and "toolResults" not in user_input_context:
+                user_input["content"] = "(empty placeholder)"
             
             # Add context if not empty (contains toolResults only, not images)
             if user_input_context:
@@ -1529,10 +1531,6 @@ def build_kiro_payload(
         })
         current_content = "(empty placeholder)"
     
-    # If content is empty - use placeholder
-    if not current_content:
-        current_content = "(empty placeholder)"
-    
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
     # This matches the native Kiro IDE format
@@ -1562,6 +1560,12 @@ def build_kiro_payload(
         tool_results = extract_tool_results_from_content(current_message.content)
         if tool_results:
             user_input_context["toolResults"] = tool_results
+    
+    # If content is empty and there are no tool results - use placeholder.
+    # A tool-result-only message (the common agent-loop case) is sent with
+    # empty content, which Kiro accepts.
+    if not current_content and "toolResults" not in user_input_context:
+        current_content = "(empty placeholder)"
     
     # Inject thinking tags if enabled (only for the current/last user message)
     # Skipped for models with native reasoning (they reason on their own)

@@ -2171,6 +2171,111 @@ class TestBuildKiroPayloadMidConversationSystemMessages:
         assert assistant["toolUses"][0]["toolUseId"] == "t1"
 
 
+class TestBuildKiroPayloadToolResultOnlyCurrentMessage:
+    """Tests for the current message when it only carries tool results (agent loop)."""
+
+    @staticmethod
+    def _tool():
+        return UnifiedTool(name="get_time", description="Get time", input_schema={"type": "object", "properties": {}})
+
+    @staticmethod
+    def _call():
+        return UnifiedMessage(role="assistant", content="",
+                              tool_calls=[{"id": "t1", "type": "function",
+                                           "function": {"name": "get_time", "arguments": "{}"}}])
+
+    def _build(self, messages, tools, thinking=False):
+        return build_kiro_payload(
+            messages=messages, system_prompt="", model_id="claude-sonnet-4", tools=tools,
+            conversation_id="conv", profile_arn="arn", thinking_config=ThinkingConfig(enabled=thinking),
+        ).payload["conversationState"]
+
+    def test_tool_result_only_current_message_has_empty_content(self):
+        """
+        What it does: Last message is a tool result with no text.
+        Purpose: The most common agent-loop request must not carry placeholder text.
+        """
+        state = self._build([
+            UnifiedMessage(role="user", content="What time?"),
+            self._call(),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "12:00"}]),
+        ], tools=[self._tool()])
+        current = state["currentMessage"]["userInputMessage"]
+        assert current["content"] == ""
+        assert current["userInputMessageContext"]["toolResults"][0]["toolUseId"] == "t1"
+        assert "(empty placeholder)" not in str(state)
+
+    def test_long_agent_loop_has_no_placeholders(self):
+        """
+        What it does: Three tool rounds with no text anywhere, then a tool result.
+        Purpose: Neither history nor current message contains placeholder text.
+        """
+        msgs = [UnifiedMessage(role="user", content="Go")]
+        for i in range(3):
+            msgs.append(UnifiedMessage(role="assistant", content="",
+                                       tool_calls=[{"id": f"t{i}", "type": "function",
+                                                    "function": {"name": "get_time", "arguments": "{}"}}]))
+            msgs.append(UnifiedMessage(role="user", content="",
+                                       tool_results=[{"type": "tool_result", "tool_use_id": f"t{i}", "content": "ok"}]))
+        state = self._build(msgs, tools=[self._tool()])
+        assert "(empty placeholder)" not in str(state)
+
+    def test_empty_current_message_without_tool_results_keeps_placeholder(self):
+        """
+        What it does: Last user message has no text and no tool results.
+        Purpose: Untested-with-Kiro case keeps the old safe behaviour.
+        """
+        state = self._build([
+            UnifiedMessage(role="user", content="Hi"),
+            UnifiedMessage(role="assistant", content="Hello"),
+            UnifiedMessage(role="user", content=""),
+        ], tools=None)
+        assert state["currentMessage"]["userInputMessage"]["content"] == "(empty placeholder)"
+
+    def test_trailing_assistant_still_gets_placeholder_user(self):
+        """
+        What it does: Conversation ends with an assistant message.
+        Purpose: The synthetic current user message keeps its placeholder.
+        """
+        state = self._build([
+            UnifiedMessage(role="user", content="Hi"),
+            UnifiedMessage(role="assistant", content="Hello"),
+        ], tools=None)
+        assert state["currentMessage"]["userInputMessage"]["content"] == "(empty placeholder)"
+
+    def test_orphaned_tool_results_without_tools_are_still_textual(self):
+        """
+        What it does: Tool result turn when no tools are defined (compaction scenario).
+        Purpose: Tool content is converted to text, so content is never empty.
+        """
+        state = self._build([
+            UnifiedMessage(role="user", content="Go"),
+            self._call(),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "12:00"}]),
+        ], tools=None)
+        current = state["currentMessage"]["userInputMessage"]
+        assert current["content"]
+        assert "toolResults" not in current.get("userInputMessageContext", {})
+
+    def test_fake_reasoning_with_tool_result_only_message(self):
+        """
+        What it does: Tool-result-only current message with fake reasoning enabled.
+        Purpose: Thinking tag injection must cope with empty content and not reintroduce the placeholder.
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            state = self._build([
+                UnifiedMessage(role="user", content="What time?"),
+                self._call(),
+                UnifiedMessage(role="user", content="",
+                               tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "12:00"}]),
+            ], tools=[self._tool()], thinking=True)
+        current = state["currentMessage"]["userInputMessage"]
+        assert "(empty placeholder)" not in current["content"]
+        assert current["userInputMessageContext"]["toolResults"][0]["toolUseId"] == "t1"
+
+
 # ==================================================================================================
 # Tests for ensure_assistant_before_tool_results
 # ==================================================================================================
@@ -4184,6 +4289,57 @@ class TestBuildKiroHistory:
         )]
         result = build_kiro_history(messages, "claude-sonnet-4")
         assert result[0]["assistantResponseMessage"]["content"] == "Let me check."
+
+    def test_tool_result_only_user_content_left_empty(self):
+        """
+        What it does: User message with tool_results and no text.
+        Purpose: Kiro accepts empty content alongside toolResults; no placeholder is sent.
+        """
+        messages = [UnifiedMessage(
+            role="user", content="",
+            tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        user = result[0]["userInputMessage"]
+        assert user["content"] == ""
+        assert user["userInputMessageContext"]["toolResults"][0]["toolUseId"] == "t1"
+
+    def test_tool_result_blocks_in_content_also_skip_placeholder(self):
+        """
+        What it does: Tool results given as blocks inside content (no tool_results field).
+        Purpose: Both tool-result sources must be recognised before deciding on a placeholder.
+        """
+        messages = [UnifiedMessage(
+            role="user",
+            content=[{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        user = result[0]["userInputMessage"]
+        if user.get("userInputMessageContext", {}).get("toolResults"):
+            assert user["content"] == ""
+        else:
+            assert user["content"] == "(empty placeholder)"
+
+    def test_empty_tool_results_list_still_gets_placeholder(self):
+        """
+        What it does: User message with an empty tool_results list and no text.
+        Purpose: An empty list is not a tool result; the turn must not be sent empty-handed.
+        """
+        messages = [UnifiedMessage(role="user", content="", tool_results=[])]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
+
+    def test_user_with_text_and_tool_results_keeps_text(self):
+        """
+        What it does: User message with both text and tool_results.
+        Purpose: Text is never replaced or dropped.
+        """
+        messages = [UnifiedMessage(
+            role="user", content="Here you go",
+            tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        assert result[0]["userInputMessage"]["content"] == "Here you go"
 
     def test_adds_empty_placeholder_for_none_user_content(self):
         """
