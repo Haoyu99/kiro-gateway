@@ -2049,3 +2049,48 @@ class TestAnthropicToKiroNonStandardRoles:
         assert all(a != b for a, b in zip(kinds, kinds[1:]))
 
         assert payload["conversationState"]["currentMessage"]["userInputMessage"]["content"] == "Hello"
+
+
+class TestAnthropicToKiroToolAddition:
+    """Tests for Claude Code tool_addition blocks reaching the converter."""
+
+    def _request(self):
+        return AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Hi"),
+                AnthropicMessage(role="assistant", content="Hello"),
+                AnthropicMessage(role="user", content="Do it"),
+                AnthropicMessage(
+                    role="system",
+                    content=[
+                        {"type": "text", "text": "Tools available: Artifact"},
+                        {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Artifact"}},
+                    ],
+                ),
+            ],
+        )
+
+    def test_tool_addition_text_kept_block_dropped(self):
+        """
+        What it does: Converts a trailing system message with text + tool_addition.
+        Purpose: Text reaches Kiro in the current user turn; the block itself leaves no trace.
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            payload = anthropic_to_kiro(self._request(), "conv", "arn")
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "Do it" in current
+        assert "Tools available: Artifact" in current
+        assert "tool_addition" not in str(payload)
+        assert "tool_reference" not in str(payload)
+
+    def test_no_synthetic_assistant_turn_for_trailing_system_message(self):
+        """
+        What it does: Checks history after a user -> system tail.
+        Purpose: The system message must not create a placeholder assistant turn.
+        """
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            payload = anthropic_to_kiro(self._request(), "conv", "arn")
+        assert "(empty placeholder)" not in str(payload)
+

@@ -166,8 +166,9 @@ def extract_text_content(content: Any) -> str:
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                # Skip image and tool_reference blocks - they're handled separately
-                if item.get("type") in ("image", "image_url", "tool_reference"):
+                # Skip non-text blocks: images are handled separately,
+                # tool_reference/tool_addition only matter for deferred tool loading
+                if item.get("type") in ("image", "image_url", "tool_reference", "tool_addition"):
                     continue
                 if item.get("type") == "text":
                     text_parts.append(item.get("text", ""))
@@ -1385,15 +1386,17 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
+            tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
             
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
+            # Fallback for empty content. Turns that carry toolUses are sent with
+            # empty content (accepted by Kiro): a placeholder there would be the
+            # most frequent text in the model's own history, and the model starts
+            # echoing it as a reply. Text-less turns without toolUses keep it.
+            if not content and not tool_uses:
                 content = "(empty placeholder)"
             
             assistant_response = {"content": content}
             
-            # Process tool_calls
-            tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
             if tool_uses:
                 assistant_response["toolUses"] = tool_uses
             
@@ -1476,19 +1479,21 @@ def build_kiro_payload(
         # Also returns flag if any tool_results were converted (to skip thinking tag injection)
         messages_with_assistants, converted_tool_results = ensure_assistant_before_tool_results(messages)
     
+    # Normalize unknown roles (e.g., 'system', 'developer') to 'user' (fixes issue #64).
+    # This must happen BEFORE merge_adjacent_messages() so that a mid-conversation
+    # system message is merged into the neighbouring user message instead of
+    # forcing a synthetic assistant turn. Synthetic assistant turns put placeholder
+    # text into the model's own history, and the model starts imitating it.
+    normalized_messages = normalize_message_roles(messages_with_assistants)
+    
     # Merge adjacent messages with the same role
-    merged_messages = merge_adjacent_messages(messages_with_assistants)
+    merged_messages = merge_adjacent_messages(normalized_messages)
     
     # Ensure first message is from user (Kiro API requirement, fixes issue #60)
     merged_messages = ensure_first_message_is_user(merged_messages)
     
-    # Normalize unknown roles to 'user' (fixes issue #64)
-    # This must happen BEFORE ensure_alternating_roles() so that consecutive
-    # messages with unknown roles (e.g., 'developer') are properly detected
-    merged_messages = normalize_message_roles(merged_messages)
-    
-    # Ensure alternating user/assistant roles (fixes issue #64)
-    # Insert synthetic assistant messages between consecutive user messages
+    # Safety net: ensure alternating user/assistant roles.
+    # After normalize + merge, consecutive user messages should no longer occur.
     merged_messages = ensure_alternating_roles(merged_messages)
     
     if not merged_messages:

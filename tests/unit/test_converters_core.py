@@ -300,6 +300,37 @@ class TestExtractTextContent:
         assert result == "Loaded tools: done"
 
 
+class TestExtractTextContentToolAddition:
+    """Tests for extract_text_content skipping deferred-tool blocks."""
+
+    def test_skips_tool_addition_blocks(self):
+        """
+        What it does: Extracts text from a list with text and tool_addition blocks.
+        Purpose: tool_addition carries no text for Kiro and must not leak into content.
+        """
+        content = [
+            {"type": "text", "text": "Tools available: Artifact"},
+            {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Artifact"}},
+        ]
+        assert extract_text_content(content) == "Tools available: Artifact"
+
+    def test_tool_addition_with_text_like_field_is_skipped(self):
+        """
+        What it does: tool_addition block that happens to carry a 'text' key.
+        Purpose: The generic "text in item" fallback must not pick it up.
+        """
+        content = [{"type": "tool_addition", "text": "should not appear"}]
+        assert extract_text_content(content) == ""
+
+    def test_only_tool_addition_blocks_returns_empty(self):
+        """
+        What it does: Content made only of tool_addition blocks.
+        Purpose: Ensure the result is empty, not a stringified dict.
+        """
+        content = [{"type": "tool_addition", "tool": {"name": "A"}}] * 3
+        assert extract_text_content(content) == ""
+
+
 # ==================================================================================================
 # Tests for extract_images_from_content (Issue #30 fix)
 # ==================================================================================================
@@ -1978,6 +2009,166 @@ class TestNormalizeAndAlternatingIntegration:
         assert result[6].role == "user" and result[6].content == "Dev2"
         assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
         assert result[8].role == "user" and result[8].content == "User2"
+
+
+class TestBuildKiroPayloadMidConversationSystemMessages:
+    """
+    Tests for system/developer messages that appear in the middle of a conversation.
+
+    Clients like Claude Code insert system messages between turns (reminders,
+    tool announcements). They must be merged into the neighbouring user turn,
+    not separated from it by a synthetic assistant turn: synthetic assistant
+    turns put placeholder text in the model's own history and the model
+    starts echoing it.
+    """
+
+    def _build(self, messages, tools=None):
+        """Builds a payload with thinking disabled and returns conversationState."""
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=tools,
+            conversation_id="conv",
+            profile_arn="arn",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        return result.payload["conversationState"]
+
+    @staticmethod
+    def _tool():
+        return UnifiedTool(name="get_time", description="Get time", input_schema={"type": "object", "properties": {}})
+
+    @staticmethod
+    def _assert_alternating(history):
+        kinds = [next(iter(entry)) for entry in history]
+        assert kinds[0] == "userInputMessage"
+        assert all(a != b for a, b in zip(kinds, kinds[1:])), kinds
+
+    @staticmethod
+    def _synthetic_assistant_count(history):
+        return sum(
+            1 for e in history
+            if e.get("assistantResponseMessage", {}).get("content") == "(empty placeholder)"
+        )
+
+    @pytest.mark.parametrize("role", ["system", "developer"])
+    def test_system_after_user_is_merged_without_synthetic_assistant(self, role):
+        """
+        What it does: user -> system -> assistant -> user.
+        Purpose: The system text is merged into the user turn; no synthetic assistant is inserted.
+        """
+        state = self._build([
+            UnifiedMessage(role="user", content="Hi"),
+            UnifiedMessage(role=role, content="Reminder"),
+            UnifiedMessage(role="assistant", content="Hello"),
+            UnifiedMessage(role="user", content="Next"),
+        ])
+        history = state["history"]
+        assert len(history) == 2
+        # The first user turn may be prefixed with gateway system-prompt additions
+        assert history[0]["userInputMessage"]["content"].endswith("Hi\nReminder")
+        assert history[1]["assistantResponseMessage"]["content"] == "Hello"
+        assert self._synthetic_assistant_count(history) == 0
+
+    def test_trailing_system_message_merged_into_current_message(self):
+        """
+        What it does: Conversation ends with a user tool_result followed by a system message.
+        Purpose: Reproduces the Claude Code request that returned 422; system text joins current message.
+        """
+        state = self._build(
+            [
+                UnifiedMessage(role="user", content="What time?"),
+                UnifiedMessage(
+                    role="assistant", content="",
+                    tool_calls=[{"id": "t1", "type": "function",
+                                 "function": {"name": "get_time", "arguments": "{}"}}],
+                ),
+                UnifiedMessage(role="user", content="",
+                               tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "12:00"}]),
+                UnifiedMessage(role="system", content="Tools just became available: Artifact"),
+            ],
+            tools=[self._tool()],
+        )
+        current = state["currentMessage"]["userInputMessage"]
+        assert "Tools just became available: Artifact" in current["content"]
+        assert current["userInputMessageContext"]["toolResults"][0]["toolUseId"] == "t1"
+        self._assert_alternating(state["history"])
+        assert self._synthetic_assistant_count(state["history"]) == 0
+
+    def test_system_between_tool_result_and_user_text_is_merged(self):
+        """
+        What it does: tool_result -> system -> user text before the next assistant turn.
+        Purpose: Tool results are preserved when three user-like turns are merged.
+        """
+        state = self._build(
+            [
+                UnifiedMessage(role="user", content="Go"),
+                UnifiedMessage(role="assistant", content="",
+                               tool_calls=[{"id": "t1", "type": "function",
+                                            "function": {"name": "get_time", "arguments": "{}"}}]),
+                UnifiedMessage(role="user", content="",
+                               tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+                UnifiedMessage(role="system", content="Sys note"),
+                UnifiedMessage(role="user", content="Continue please"),
+                UnifiedMessage(role="assistant", content="Done"),
+                UnifiedMessage(role="user", content="Thanks"),
+            ],
+            tools=[self._tool()],
+        )
+        history = state["history"]
+        self._assert_alternating(history)
+        merged_user = history[2]["userInputMessage"]
+        assert "Sys note" in merged_user["content"]
+        assert "Continue please" in merged_user["content"]
+        assert merged_user["userInputMessageContext"]["toolResults"][0]["toolUseId"] == "t1"
+        assert self._synthetic_assistant_count(history) == 0
+
+    def test_many_consecutive_system_messages_collapse_into_one_turn(self):
+        """
+        What it does: Five system messages in a row, then user.
+        Purpose: No synthetic assistant turns, all text kept in order.
+        """
+        msgs = [UnifiedMessage(role="system", content=f"S{i}") for i in range(5)]
+        msgs += [UnifiedMessage(role="user", content="Q")]
+        state = self._build(msgs)
+        assert state.get("history", []) == []
+        content = state["currentMessage"]["userInputMessage"]["content"]
+        assert content.endswith("S0\nS1\nS2\nS3\nS4\nQ")
+
+    def test_leading_system_message_still_starts_with_user(self):
+        """
+        What it does: system -> assistant -> user.
+        Purpose: Normalizing before ensure_first_message_is_user avoids a synthetic user turn.
+        """
+        state = self._build([
+            UnifiedMessage(role="system", content="Rules"),
+            UnifiedMessage(role="assistant", content="Ok"),
+            UnifiedMessage(role="user", content="Hi"),
+        ])
+        history = state["history"]
+        assert history[0]["userInputMessage"]["content"].endswith("Rules")
+        assert "(empty placeholder)" not in str(history)
+
+    def test_tool_only_assistant_turn_has_empty_content_not_placeholder(self):
+        """
+        What it does: Assistant history turn with tool calls but no text.
+        Purpose: Placeholder text must not appear in the model's own tool-use turns.
+        """
+        state = self._build(
+            [
+                UnifiedMessage(role="user", content="Go"),
+                UnifiedMessage(role="assistant", content="",
+                               tool_calls=[{"id": "t1", "type": "function",
+                                            "function": {"name": "get_time", "arguments": "{}"}}]),
+                UnifiedMessage(role="user", content="",
+                               tool_results=[{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+            ],
+            tools=[self._tool()],
+        )
+        assistant = state["history"][1]["assistantResponseMessage"]
+        assert assistant["content"] == ""
+        assert assistant["toolUses"][0]["toolUseId"] == "t1"
 
 
 # ==================================================================================================
@@ -3953,6 +4144,47 @@ class TestBuildKiroHistory:
         print("Checking that '(empty placeholder)' placeholder is added...")
         assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
     
+    def test_tool_only_assistant_content_left_empty(self):
+        """
+        What it does: Assistant message with tool_calls and no text.
+        Purpose: Kiro accepts empty content alongside toolUses; no placeholder for the model to imitate.
+        """
+        messages = [UnifiedMessage(
+            role="assistant", content="",
+            tool_calls=[{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        assert result[0]["assistantResponseMessage"]["content"] == ""
+        assert len(result[0]["assistantResponseMessage"]["toolUses"]) == 1
+
+    def test_tool_use_blocks_in_content_also_skip_placeholder(self):
+        """
+        What it does: Tool use given as Anthropic-style blocks inside content (no tool_calls field).
+        Purpose: Both tool-use sources must be recognised before deciding on a placeholder.
+        """
+        messages = [UnifiedMessage(
+            role="assistant",
+            content=[{"type": "tool_use", "id": "t1", "name": "f", "input": {}}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        assistant = result[0]["assistantResponseMessage"]
+        if assistant.get("toolUses"):
+            assert assistant["content"] == ""
+        else:
+            assert assistant["content"] == "(empty placeholder)"
+
+    def test_assistant_with_text_and_tool_calls_keeps_text(self):
+        """
+        What it does: Assistant message with both text and tool_calls.
+        Purpose: Text is never replaced or dropped.
+        """
+        messages = [UnifiedMessage(
+            role="assistant", content="Let me check.",
+            tool_calls=[{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        assert result[0]["assistantResponseMessage"]["content"] == "Let me check."
+
     def test_adds_empty_placeholder_for_none_user_content(self):
         """
         What it does: Verifies that "(empty placeholder)" placeholder is added for user messages with None content.

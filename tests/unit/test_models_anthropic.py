@@ -22,6 +22,7 @@ from kiro.models_anthropic import (
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ToolAdditionContentBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -1052,6 +1053,73 @@ class TestToolReferenceContentBlock:
 
         print(f"Comparing type: Expected 'tool_reference', Got '{block.type}'")
         assert block.type == "tool_reference"
+
+
+class TestToolAdditionContentBlock:
+    """Tests for ToolAdditionContentBlock (Claude Code deferred tool announcements)."""
+
+    def test_valid_tool_addition_block(self):
+        """
+        What it does: Creates a block with the exact shape Claude Code sends.
+        Purpose: Ensure the model accepts real-world tool_addition payloads.
+        """
+        block = ToolAdditionContentBlock(tool={"type": "tool_reference", "name": "Artifact"})
+        assert block.type == "tool_addition"
+        assert block.tool == {"type": "tool_reference", "name": "Artifact"}
+
+    def test_tool_field_is_optional(self):
+        """
+        What it does: Creates a block without the tool field.
+        Purpose: A block we ignore downstream must not fail validation on missing data.
+        """
+        assert ToolAdditionContentBlock().tool is None
+
+    def test_allows_extra_fields(self):
+        """
+        What it does: Passes cache_control and an unknown field.
+        Purpose: Claude Code attaches cache_control; future fields must not cause 422.
+        """
+        block = ToolAdditionContentBlock(
+            tool={"type": "tool_reference", "name": "ListAgents"},
+            cache_control={"type": "ephemeral"},
+            future_field=1,
+        )
+        assert block.tool["name"] == "ListAgents"
+
+    def test_rejects_non_dict_tool(self):
+        """
+        What it does: Passes a string as tool.
+        Purpose: Malformed values still fail at the validation boundary.
+        """
+        with pytest.raises(ValidationError):
+            ToolAdditionContentBlock(tool="Artifact")
+
+    def test_system_message_with_tool_additions_validates(self):
+        """
+        What it does: Validates the exact message that produced the 422 (text + tool_addition blocks).
+        Purpose: Regression test for Claude Code mid-conversation tool announcements.
+        """
+        msg = AnthropicMessage(
+            role="system",
+            content=[
+                {"type": "text", "text": "The following tools just became available:\nArtifact"},
+                {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Artifact"}},
+                {
+                    "type": "tool_addition",
+                    "tool": {"type": "tool_reference", "name": "ListAgents"},
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+        )
+        assert [b.type for b in msg.content] == ["text", "tool_addition", "tool_addition"]
+
+    def test_unknown_block_type_still_rejected(self):
+        """
+        What it does: Sends a block type that is not modelled.
+        Purpose: Adding tool_addition must not loosen validation for arbitrary types.
+        """
+        with pytest.raises(ValidationError):
+            AnthropicMessage(role="user", content=[{"type": "made_up_block", "foo": 1}])
 
 
 # ==================================================================================================

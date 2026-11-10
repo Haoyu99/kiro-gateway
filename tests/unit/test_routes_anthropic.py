@@ -401,6 +401,30 @@ class TestMessagesValidation:
         assert response.status_code != 422
 
 
+    def test_accepts_tool_addition_blocks_in_system_message(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Posts the Claude Code mid-conversation tool announcement shape.
+        Purpose: Regression for 422 'messages.N.content.str: Input should be a valid string'.
+        """
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "Tools available: Artifact"},
+                        {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "Artifact"},
+                         "cache_control": {"type": "ephemeral"}},
+                    ]},
+                ],
+            },
+        )
+        assert response.status_code != 422
+
+
 # =============================================================================
 # Tests for /v1/messages system prompt
 # =============================================================================

@@ -92,6 +92,26 @@ class ToolReferenceContentBlock(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ToolAdditionContentBlock(BaseModel):
+    """
+    Tool addition content block (Claude Code deferred tools).
+
+    Sent by Claude Code inside mid-conversation system messages to announce
+    that a deferred tool (``defer_loading: true``) is now available. The
+    ``tool`` field holds a reference such as ``{"type": "tool_reference",
+    "name": "Artifact"}``.
+
+    Kiro has no deferred tool loading: the gateway always sends every tool
+    with its full schema, so this block carries no information Kiro needs.
+    It is accepted for validation and skipped during conversion.
+    """
+
+    type: Literal["tool_addition"] = "tool_addition"
+    tool: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
+
+
 class ToolResultContentBlock(BaseModel):
     """
     Tool result content block in Anthropic format.
@@ -170,6 +190,7 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ToolAdditionContentBlock,
 ]
 
 
